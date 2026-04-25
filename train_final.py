@@ -45,7 +45,7 @@ import pandas as pd
 BATCH_SIZE = 16 
 LEARNING_RATE = 1e-4
 EPOCHS = 10
-NUM_CLASSES = 5
+NUM_CLASSES = 3
 NOISE_TIMESTEPS = 1000
 CAP = 400
 MAX_PROMPT_LENGTH = 77 
@@ -64,12 +64,12 @@ CHECKPOINT_DIR = "./checkpoints"
 # =============================================================================
 
 class SafetyCategories:
-    CATEGORIES = ['safe', 'violence', 'sexual', 'illegal_activity', 'disturbing']
-    NUM_CLASSES = 5
+    CATEGORIES = ['safe', 'nudity', 'violence']
+    NUM_CLASSES = 3
     IDX = {cat: i for i, cat in enumerate(CATEGORIES)}
     
-CLASS_NAMES = ['Safe', 'Violence', 'Sexual', 'Illegal Activity', 'Disturbing']
-CLASS_COLORS = [(100, 200, 100), (255, 100, 100), (200, 0, 0), (150, 150, 255), (180, 100, 200)]
+CLASS_NAMES = ['Safe', 'Nudity', 'Violence']
+CLASS_COLORS = [(100, 200, 100), (200, 0, 150), (255, 50, 50)]
 
 # =============================================================================
 # SETUP
@@ -79,12 +79,12 @@ load_dotenv()
 HF_TOKEN = os.getenv("HF_TOKEN")
 if HF_TOKEN:
     login(token=HF_TOKEN)
-    print("[+] Authenticated with HuggingFace")
+    print("[STATUS] Authenticated with HuggingFace")
 else:
-    print("[!] Warning: HF_TOKEN not found in .env file")
+    print("[WARNING] Warning: HF_TOKEN not found in .env file")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"[+] Using device: {DEVICE}")
+print(f"[STATUS] Using device: {DEVICE}")
 
 # Create directories
 for directory in [OUTPUT_DIR, HEATMAP_DIR, OUTLINED_DIR, METADATA_DIR, COMBINED_DIR, CHECKPOINT_DIR]:
@@ -153,34 +153,32 @@ def make_safety_vector(categories: List[str]) -> List[float]:
             vec[SafetyCategories.IDX[cat]] = 1.0
     return vec
 
-def load_datasets_lazy():
-    """ Load dataset from kricko/cleaned_auditor, apply balanced sampling 
-    (1500 per class, excluding 'hate'), and split into train/val/test.
+def load_datasets_lazy(mode='balanced'):
+    """ Load dataset from ShreyashDhoot/internvl-auditor-v2, apply sampling 
+    based on 'mode' ('balanced' = min-sampling, 'weighted' = full for sampler), 
+    and split into train/val/test.
     """
     hf_datasets = {}
     
     print("\n" + "="*80)
-    print("LOADING AND SAMPLING DATASETS")
+    print(f"LOADING AND SAMPLING DATASETS (Mode: {mode})")
     print("="*80)
 
     # Column name in the HF dataset → SafetyCategories key
     COL_TO_CAT = {
-        'safe':             'safe',
-        'violence':         'violence',
-        'sexual':           'sexual',
-        'illegal activity': 'illegal_activity',
-        'disturbing':       'disturbing',
+        'safe':     'safe',
+        'nudity':   'nudity',
+        'violence': 'violence',
     }
 
     try:
-        print("\n[1/1] Loading kricko/cleaned_auditor...")
-        # Force redownload to avoid schema mismatch with cached metadata
+        print("\n[1/1] Loading ShreyashDhoot/internvl-auditor-v2...")
         ds = load_dataset(
-            "kricko/cleaned_auditor", 
+            "ShreyashDhoot/internvl-auditor-v2", 
             split="train", 
-            download_mode="force_redownload"
+            download_mode="reuse_dataset_if_exists"
         )
-        hf_datasets['cleaned_auditor'] = ds
+        hf_datasets['internvl-auditor-v2'] = ds
         print(f"  Loaded {len(ds)} rows. Columns: {ds.column_names}")
 
         label_cols = [c for c in COL_TO_CAT.keys() if c in ds.column_names]
@@ -189,8 +187,6 @@ def load_datasets_lazy():
         # We'll group indices by their active class
         class_indices = {cat: [] for cat in COL_TO_CAT.values()}
         
-        # To avoid massive memory usage if we only need a few thousand, 
-        # we can still load all metadata or just iterate.
         print("  Scanning dataset for class distribution...")
         df = ds.select_columns(cols_needed).to_pandas()
         
@@ -200,30 +196,43 @@ def load_datasets_lazy():
                 if row.get(col, 0) == 1
             ]
             if not active_cats:
-                active_cats.append('safe')
+                continue
             
-            # For sampling, assign to the FIRST active category matching our target list
-            # Priorities: safe (last), then others
-            primary_cat = active_cats[0]
+            # Priorities: unsafe categories first
+            unsafe_cats = [cat for cat in active_cats if cat != 'safe']
+            primary_cat = unsafe_cats[0] if unsafe_cats else 'safe'
+            
             if primary_cat in class_indices:
                 class_indices[primary_cat].append(j)
 
-        # Labels to sample (1500 each)
-        target_labels = ['disturbing', 'illegal_activity', 'safe', 'sexual', 'violence']
+        # Labels to sample
+        target_labels = ['safe', 'nudity', 'violence']
         sampled_metadata = []
         
-        print("\n  Balanced Sampling (max 1500 per class):")
+        counts = {cat: len(class_indices.get(cat, [])) for cat in target_labels}
+        min_samples = min(counts.values()) if counts else 0
+        
+        if mode == 'balanced':
+            print(f"\n  Mode 'balanced': Under-sampling to min samples={min_samples} for all classes.")
+        else:
+            print(f"\n  Mode 'weighted': Keeping all available samples for weighted sampling.")
+        
         random.seed(42) # For reproducibility
         
         for cat in target_labels:
-            indices = class_indices[cat]
+            indices = class_indices.get(cat, [])
             if not indices:
-                print(f"    [!] No samples found for {cat}")
+                print(f"    [WARNING] No samples found for {cat}")
                 continue
+            
+            if mode == 'balanced':
+                num_to_sample = min_samples
+                sampled_idx = random.sample(indices, num_to_sample)
+            else:
+                sampled_idx = indices # Keep all
+                num_to_sample = len(indices)
                 
-            num_to_sample = min(1500, len(indices))
-            sampled_idx = random.sample(indices, num_to_sample)
-            print(f"    {cat:20s}: {len(indices):>6} available -> {num_to_sample:>4} sampled")
+            print(f"    {cat:20s}: {len(indices):>6} available -> {num_to_sample:>4} in metadata")
             
             for idx in sampled_idx:
                 row = df.iloc[idx]
@@ -231,21 +240,21 @@ def load_datasets_lazy():
                     COL_TO_CAT[col] for col in label_cols
                     if row.get(col, 0) == 1
                 ]
-                # Re-calculate safety vector for this row
                 sv = make_safety_vector(active_cats)
                 binary_label = 1 if any(c != 'safe' for c in active_cats) else 0
                 prompt_str = str(row.get('prompt', ''))
                 
                 sampled_metadata.append({
-                    'ds':           'cleaned_auditor',
+                    'ds':           'internvl-auditor-v2',
                     'row':          int(idx),
                     'safety_vec':   sv,
                     'binary_label': binary_label,
                     'prompt':       prompt_str,
+                    'label_idx':    SafetyCategories.IDX[cat]
                 })
 
     except Exception as e:
-        print(f"  [!] Failed to load dataset: {e}")
+        print(f"  [WARNING] Failed to load dataset: {e}")
         raise
 
     if not sampled_metadata:
@@ -268,13 +277,13 @@ def load_datasets_lazy():
     print("="*80)
     all_prompts = [m['prompt'] for m in sampled_metadata if m['prompt']]
     TOKENIZER.build_vocab(all_prompts)
-    print(f"[+] Vocabulary size: {len(TOKENIZER.word_to_idx)}")
+    print(f"[STATUS] Vocabulary size: {len(TOKENIZER.word_to_idx)}")
     
     # Save vocabulary for inference
     vocab_path = os.path.join(CHECKPOINT_DIR, "vocab.json")
     with open(vocab_path, "w") as f:
         json.dump(TOKENIZER.word_to_idx, f)
-    print(f"[+] Saved vocabulary to {vocab_path}")
+    print(f"[STATUS] Saved vocabulary to {vocab_path}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "="*80)
@@ -417,7 +426,7 @@ class CompleteMultiTaskAuditor(nn.Module):
         )
 
         # ── Cross-attention path (image queries text tokens) ──────────────────
-        print("  [+] Cross-Attention (pre-LN, key_padding_mask)")
+        print("  [STATUS] Cross-Attention (pre-LN, key_padding_mask)")
         self.image_proj   = nn.Conv2d(2048, 512, kernel_size=1)
         self.query_norm   = nn.LayerNorm(512)   # pre-LN on Q (image patches)
         self.key_norm     = nn.LayerNorm(512)   # pre-LN on K/V (text tokens)
@@ -426,7 +435,7 @@ class CompleteMultiTaskAuditor(nn.Module):
         )
 
         # ── CLIP-style faithfulness projection heads ──────────────────────────
-        print("  [+] CLIP Faithfulness Projection Heads")
+        print("  [STATUS] CLIP Faithfulness Projection Heads")
         self.img_proj_head = nn.Sequential(
             nn.Linear(512, 256),
             nn.ReLU(),
@@ -441,7 +450,7 @@ class CompleteMultiTaskAuditor(nn.Module):
         self.log_temperature = nn.Parameter(torch.tensor([-2.659]))   # ln(0.07)
 
         # ── Timestep embedding ────────────────────────────────────────────────
-        print("  [+] Timestep Embedding + FiLM Heads")
+        print("  [STATUS] Timestep Embedding + FiLM Heads")
         self.timestep_embed = nn.Sequential(
             nn.Linear(1, 128), nn.SiLU(),
             nn.Linear(128, 256), nn.SiLU(),
@@ -453,7 +462,7 @@ class CompleteMultiTaskAuditor(nn.Module):
         self.film_seam = nn.Linear(512, 512 * 2)    # → (gamma [512], beta [512])
 
         # ── Relative adversary head (FiLM-conditioned) ───────────────────────
-        print("  [+] Relative Adversary Score Head")
+        print("  [STATUS] Relative Adversary Score Head")
         self.relative_adv_head = nn.Sequential(
             nn.Linear(2048, 512), nn.ReLU(), nn.Dropout(0.2),
             nn.Linear(512, 256), nn.ReLU(),
@@ -461,7 +470,7 @@ class CompleteMultiTaskAuditor(nn.Module):
         )
 
         # ── Seam quality head (FiLM-conditioned) ─────────────────────────────
-        print("  [+] Seam Quality Assessment Head")
+        print("  [STATUS] Seam Quality Assessment Head")
         # Split into a feature extractor (FiLM applied between convs) and classifier
         self.seam_feat = nn.Sequential(
             nn.Conv2d(2048, 512, kernel_size=3, padding=1),
@@ -723,8 +732,12 @@ def train_epoch(model, loader, optimizer, epoch_num):
         'relative_adv': 0.0, 'seam': 0.0, 'contrastive': 0.0
     }
 
+    # Define class weights for imbalance (safe: 1.0, nudity: 5.0, violence: 2.0)
+    # This weights 'nudity' significantly more as requested by the user.
+    class_weights = torch.tensor([1.0, 5.0, 2.0], dtype=torch.float32).to(DEVICE)
+    
     criterion_binary  = nn.BCEWithLogitsLoss()
-    criterion_class   = nn.CrossEntropyLoss()
+    criterion_class   = nn.CrossEntropyLoss(weight=class_weights)
     criterion_qual    = nn.MSELoss()
     criterion_seam    = nn.MSELoss()
     criterion_rel_adv = nn.MSELoss()
@@ -799,26 +812,64 @@ def train_epoch(model, loader, optimizer, epoch_num):
     return avg_losses
 
 def evaluate(model, loader):
-    """Evaluate binary accuracy"""
+    """Evaluate binary accuracy and validation loss"""
     model.eval()
     correct = 0
     total = 0
+    total_loss = 0.0
+    
+    # Define class weights for validation loss (must match training weights)
+    class_weights = torch.tensor([1.0, 5.0, 2.0], dtype=torch.float32).to(DEVICE)
+    
+    criterion_binary  = nn.BCEWithLogitsLoss()
+    criterion_class   = nn.CrossEntropyLoss(weight=class_weights)
+    criterion_qual    = nn.MSELoss()
+    criterion_seam    = nn.MSELoss()
+    criterion_rel_adv = nn.MSELoss()
     
     with torch.no_grad():
         for batch in loader:
-            images = batch['image'].to(DEVICE)
-            b_labels = batch['binary_label'].to(DEVICE).unsqueeze(1)
+            images      = batch['image'].to(DEVICE)
+            b_labels    = batch['binary_label'].to(DEVICE).unsqueeze(1)
+            c_labels    = batch['class_label'].to(DEVICE)
+            q_labels    = batch['quality_score'].to(DEVICE).unsqueeze(1)
             text_tokens = batch['text_tokens'].to(DEVICE)
-            timesteps = batch['timestep'].to(DEVICE)
+            timesteps   = batch['timestep'].to(DEVICE)
+            seam_gt     = batch['seam_quality_gt'].to(DEVICE).unsqueeze(1)
             
             outputs = model(images, text_tokens=text_tokens, timestep=timesteps)
+            
+            # Loss calculation
+            loss_b        = criterion_binary(outputs['binary_logits'], b_labels)
+            loss_c        = criterion_class(outputs['class_logits'], c_labels)
+            loss_q        = criterion_qual(torch.sigmoid(outputs['quality_logits']), q_labels)
+            loss_rel_adv  = criterion_rel_adv(outputs['relative_adv_score'], b_labels)
+            loss_seam     = criterion_seam(outputs['seam_quality_score'], seam_gt)
+            
+            # InfoNCE loss (alignment)
+            loss_contrastive = info_nce_loss(outputs['img_embed'], outputs['txt_embed'], model.log_temperature)
+            
+            # Weighted total loss (must match training λ-weights)
+            loss = (
+                1.0 * loss_b            +
+                0.5 * loss_c            +
+                0.3 * loss_q            +
+                0.4 * loss_rel_adv      +
+                0.3 * loss_seam         +
+                0.5 * loss_contrastive
+            )
+            
+            total_loss += loss.item()
+            
+            # Accuracy
             probs = torch.sigmoid(outputs['binary_logits'])
             preds = (probs > 0.5).float()
-            
             total += b_labels.size(0)
             correct += (preds == b_labels).sum().item()
             
-    return correct / total if total > 0 else 0.0
+    avg_loss = total_loss / len(loader) if len(loader) > 0 else 0.0
+    accuracy = correct / total if total > 0 else 0.0
+    return accuracy, avg_loss
 
 
 # =============================================================================
@@ -1179,13 +1230,13 @@ def create_combined_visualization(model, image, prompt, idx, metadata, outputs, 
     
     # Determine status
     if metadata['predictions']['adversarial_probability'] > 0.7:
-        status = "[!] HIGH RISK"
+        status = "[WARNING] HIGH RISK"
         status_color = '#ff4444'
     elif metadata['predictions']['adversarial_probability'] > 0.4:
         status = "[~] MODERATE RISK"
         status_color = '#ffaa00'
     else:
-        status = "[+] SAFE"
+        status = "[STATUS] SAFE"
         status_color = '#44ff44'
     
     scores_text = f"""
@@ -1237,19 +1288,19 @@ STATUS: {status}
 [METRIC INTERPRETATION]
 
 * Seam Quality ({metadata['predictions']['seam_quality']:.3f}):
-  {"  [+] High quality - no visible artifacts" if metadata['predictions']['seam_quality'] > 0.7 
+  {"  [STATUS] High quality - no visible artifacts" if metadata['predictions']['seam_quality'] > 0.7 
    else "  [~] Moderate quality - minor artifacts possible" if metadata['predictions']['seam_quality'] > 0.4
-   else "  [!] Low quality - visible inpainting artifacts detected"}
+   else "  [WARNING] Low quality - visible inpainting artifacts detected"}
 
 * Relative Adversary ({metadata['predictions']['relative_adversary_score']:.3f}):
-  {"  [+] Low adversarial strength" if metadata['predictions']['relative_adversary_score'] < 0.3
+  {"  [STATUS] Low adversarial strength" if metadata['predictions']['relative_adversary_score'] < 0.3
    else "  [~] Moderate adversarial strength" if metadata['predictions']['relative_adversary_score'] < 0.7
-   else "  [!] High adversarial strength"}
+   else "  [WARNING] High adversarial strength"}
 
 * Faithfulness ({metadata['predictions']['faithfulness_score']:.3f}):
-  {"  [+] High alignment with prompt" if metadata['predictions']['faithfulness_score'] > 0.7
+  {"  [STATUS] High alignment with prompt" if metadata['predictions']['faithfulness_score'] > 0.7
    else "  [~] Moderate alignment with prompt" if metadata['predictions']['faithfulness_score'] > 0.4
-   else "  [!] Low alignment with prompt"}
+   else "  [WARNING] Low alignment with prompt"}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     """
@@ -1350,7 +1401,7 @@ STATUS: {status}
     plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
     
-    print(f"  [+] Saved combined visualization: {output_path}")
+    print(f"  [STATUS] Saved combined visualization: {output_path}")
     
     return output_path
 
@@ -1539,9 +1590,9 @@ def generate_complete_explanation(predicted_class_idx, binary_prob, seam_quality
     class_name = CLASS_NAMES[predicted_class_idx]
     
     if binary_prob < 0.3:
-        explanation = f"[+] Image appears safe (confidence: {binary_prob:.1%}). "
+        explanation = f"[STATUS] Image appears safe (confidence: {binary_prob:.1%}). "
     else:
-        explanation = f"[!] Image classified as '{class_name}' with {binary_prob:.1%} confidence. "
+        explanation = f"[WARNING] Image classified as '{class_name}' with {binary_prob:.1%} confidence. "
     
     # Seam quality assessment
     if seam_quality < 0.5:
@@ -1609,7 +1660,7 @@ def inference(model, image, prompt=""):
             image = image.convert('RGB')
 
     if len(TOKENIZER.word_to_idx) <= 4:
-        print("[!] Warning: tokenizer vocabulary not built. Call load_datasets_lazy() first.")
+        print("[WARNING] Warning: tokenizer vocabulary not built. Call load_datasets_lazy() first.")
 
     image_tensor = transform(image).unsqueeze(0).to(DEVICE)
     text_tokens  = TOKENIZER.encode(prompt).unsqueeze(0).to(DEVICE)
@@ -1657,24 +1708,28 @@ def inference(model, image, prompt=""):
 
 def main():
     """Main training and analysis pipeline with complete visualization"""
+    parser = argparse.ArgumentParser(description="Adversarial Image Auditor Training")
+    parser.add_argument('--sampler_mode', type=str, default='weighted', choices=['balanced', 'weighted'],
+                        help="Sampler mode: 'balanced' (random under-sampling) or 'weighted' (WeightedRandomSampler)")
+    args = parser.parse_args()
+
     print("\n" + "="*80)
     print("COMPLETE ADVERSARIAL IMAGE AUDITOR WITH FULL VISUALIZATION")
     print("="*80)
+    print(f"Mode: {args.sampler_mode.upper()}")
     print("Features:")
-    print("  [+] Seam Quality Assessment")
-    print("  [+] Relative Adversary Score")
-    print("  [+] Text-Conditioned Faithfulness")
-    print("  [+] Complete Combined Visualizations")
-    print("  [+] Individual Heatmaps")
-    print("  [+] Object Detection Outlines")
+    print("  [STATUS] Seam Quality Assessment")
+    print("  [STATUS] Relative Adversary Score")
+    print("  [STATUS] Text-Conditioned Faithfulness")
+    print("  [STATUS] Complete Combined Visualizations")
+    print("  [STATUS] Individual Heatmaps")
+    print("  [STATUS] Object Detection Outlines")
     print("="*80)
     
     # Load datasets
-    hf_datasets, train_metadata, val_metadata, test_metadata = load_datasets_lazy()
+    hf_datasets, train_metadata, val_metadata, test_metadata = load_datasets_lazy(mode=args.sampler_mode)
     
-    # (The splitting is now handled within load_datasets_lazy)
-    
-    print(f"\n[+] Data splits prepared:")
+    print(f"\n[STATUS] Data splits prepared:")
     print(f"    Train samples: {len(train_metadata)}")
     print(f"    Val samples:   {len(val_metadata)}")
     print(f"    Test samples:  {len(test_metadata)}")
@@ -1717,7 +1772,21 @@ def main():
     )
     
     # Dataloaders
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+    if args.sampler_mode == 'weighted':
+        from torch.utils.data import WeightedRandomSampler
+        print("[STATUS] Initializing WeightedRandomSampler for balanced batches...")
+        target_indices = [item['label_idx'] for item in train_metadata]
+        # Count samples per class in training set
+        class_sample_counts = [len([i for i in target_indices if i == c]) for c in range(NUM_CLASSES)]
+        print(f"    Class counts: {class_sample_counts}")
+        weights = 1. / torch.tensor(class_sample_counts, dtype=torch.float32)
+        samples_weights = weights[target_indices]
+        sampler = WeightedRandomSampler(weights=samples_weights, num_samples=len(samples_weights), replacement=True)
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, num_workers=2)
+    else:
+        # 'balanced' mode uses simple shuffling since the metadata is already pruned/balanced
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
     
@@ -1734,11 +1803,11 @@ def main():
     print("TRAINING")
     print("="*80)
     
-    best_acc = 0.0
+    best_val_loss = float('inf')
     
     for epoch in range(EPOCHS):
         avg_losses = train_epoch(model, train_loader, optimizer, epoch + 1)
-        val_acc = evaluate(model, val_loader)
+        val_acc, val_loss = evaluate(model, val_loader)
         
         print(f"\nEpoch {epoch + 1}/{EPOCHS}")
         print(f"  Total Loss:    {avg_losses['total']:.4f}")
@@ -1746,12 +1815,12 @@ def main():
         print(f"  Seam:          {avg_losses['seam']:.4f}  | Rel.Adv: {avg_losses['relative_adv']:.4f}")
         print(f"  Contrastive:   {avg_losses['contrastive']:.4f}  | Quality: {avg_losses['quality']:.4f}")
         print(f"  Temperature:   {model.log_temperature.exp().item():.4f}")
-        print(f"  Val Acc:       {val_acc * 100:.2f}%")
+        print(f"  Val Acc:       {val_acc * 100:.2f}% | Val Loss: {val_loss:.4f}")
         
-        if val_acc > best_acc:
-            best_acc = val_acc
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/complete_auditor_best.pth")
-            print(f"  [+] Saved new best model")
+            print(f"  [STATUS] Saved new best model (lowest val loss)")
             
         torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/complete_auditor_latest.pth")
     
@@ -1760,7 +1829,7 @@ def main():
     print("LOADING BEST MODEL")
     print("="*80)
     model.load_state_dict(torch.load(f"{CHECKPOINT_DIR}/complete_auditor_best.pth"))
-    print("[+] Loaded best model checkpoint")
+    print("[STATUS] Loaded best model checkpoint")
     
     # Analyze ALL test images with COMPLETE VISUALIZATION from TEST dataset
     print("\n" + "="*80)
@@ -1854,14 +1923,14 @@ def main():
     plt.title("Confusion Matrix: Adversarial Image Auditor")
     cm_path = os.path.join(OUTPUT_DIR, "confusion_matrix.png")
     plt.savefig(cm_path)
-    print(f"[+] Confusion matrix saved to: {cm_path}")
+    print(f"[STATUS] Confusion matrix saved to: {cm_path}")
     
     # Classification Report
     report = classification_report(all_true_labels, all_pred_labels, target_names=CLASS_NAMES, output_dict=True)
     report_df = pd.DataFrame(report).transpose()
     report_path = os.path.join(OUTPUT_DIR, "classification_report.csv")
     report_df.to_csv(report_path)
-    print(f"[+] Classification report saved to: {report_path}")
+    print(f"[STATUS] Classification report saved to: {report_path}")
     
     print("\nDetailed Metrics:")
     print(classification_report(all_true_labels, all_pred_labels, target_names=CLASS_NAMES))
@@ -1871,14 +1940,14 @@ def main():
     print("\n" + "="*80)
     print("SUMMARY OF FEATURES")
     print("="*80)
-    print("  [+] Seam quality assessment (detects inpainting artifacts)")
-    print("  [+] Relative adversary score (continuous 0-1)")
-    print("  [+] Text-conditioned faithfulness (actual prompt processing)")
-    print("  [+] Timestep-aware features (diffusion timestep embedding)")
-    print("  [+] Complete combined visualizations")
-    print("  [+] All heatmaps, scores, and explanations in single images")
-    print("  [+] Individual heatmap exports")
-    print("  [+] Object detection with outlines")
+    print("  [STATUS] Seam quality assessment (detects inpainting artifacts)")
+    print("  [STATUS] Relative adversary score (continuous 0-1)")
+    print("  [STATUS] Text-conditioned faithfulness (actual prompt processing)")
+    print("  [STATUS] Timestep-aware features (diffusion timestep embedding)")
+    print("  [STATUS] Complete combined visualizations")
+    print("  [STATUS] All heatmaps, scores, and explanations in single images")
+    print("  [STATUS] Individual heatmap exports")
+    print("  [STATUS] Object detection with outlines")
     print("="*80)
 
 if __name__ == "__main__":

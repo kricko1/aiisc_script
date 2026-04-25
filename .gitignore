@@ -1,10 +1,45 @@
-.venv
-pyproject.toml
-uv.lock
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Dataset and Large Files
+*.parquet
+*.jsonl
+*.csv
+/analysis_outputs/
+/checkpoints/
+/test_set_visualizations/
+/incorrect_predictions_eval/
+/masking_verification/
+*.pth
+*.json
+
+# Environment
 .env
-auditor_inference.py
-auditor_model_card.md
-upload_to_hub.py
-checkpoints/
-train_0.parquet
-analysis_outputs/
+.DS_Store
+
+# Large folders
+.cache/
+.ipynb_checkpoints/
